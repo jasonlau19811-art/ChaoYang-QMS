@@ -1,595 +1,695 @@
-import json
-from io import BytesIO
+
+import io
+import math
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score
-from sklearn.pipeline import Pipeline
+import ta
 
 st.set_page_config(
-    page_title="HunterTrend V2.1",
-    page_icon="📈",
+    page_title="HunterTrend Professional",
+    page_icon="🦅",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_WATCHLIST = {
-    "汇川技术": "300124",
-    "特变电工": "600089",
-    "创业板ETF": "159915",
-}
+# -----------------------------
+# 基础设置与样式
+# -----------------------------
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; padding-bottom: 2rem;}
+[data-testid="stMetricValue"] {font-size: 1.35rem;}
+.small-note {font-size: 0.82rem; color: #777;}
+.signal-buy {padding: 12px; border-radius: 10px; background: rgba(0,180,90,.12);}
+.signal-hold {padding: 12px; border-radius: 10px; background: rgba(255,180,0,.12);}
+.signal-sell {padding: 12px; border-radius: 10px; background: rgba(230,60,60,.12);}
+</style>
+""", unsafe_allow_html=True)
 
-ALIASES = {
-    "日期": "date",
-    "交易日期": "date",
-    "开盘": "open",
-    "最高": "high",
-    "最低": "low",
-    "收盘": "close",
-    "成交量": "volume",
-}
+DEFAULT_POOL = "600519,300750,002594,000001,601318,600036"
 
-ML_FEATURES = [
-    "ret1", "ret5", "ret10", "ret20", "ret60", "ret120",
-    "pma5", "pma20", "pma60", "pma120",
-    "macdh", "rsi", "atrp", "vol20", "vratio", "bbpos", "dd60",
-]
-
-
-def init_state():
-    if "watchlist" not in st.session_state:
-        st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
-    if "batch_results" not in st.session_state:
-        st.session_state.batch_results = pd.DataFrame()
-
-
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        raise ValueError("行情数据为空。")
-    x = df.copy()
-    x.columns = [ALIASES.get(str(c).strip(), str(c).strip().lower()) for c in x.columns]
-    required = {"date", "open", "high", "low", "close", "volume"}
-    missing = required - set(x.columns)
-    if missing:
-        raise ValueError(f"缺少字段：{sorted(missing)}")
-    x["date"] = pd.to_datetime(x["date"], errors="coerce")
-    for col in ["open", "high", "low", "close", "volume"]:
-        x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = (
-        x.dropna(subset=["date", "open", "high", "low", "close"])
-        .sort_values("date")
-        .drop_duplicates("date", keep="last")
-        .reset_index(drop=True)
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = pd.DataFrame(
+        columns=["股票代码", "持仓成本", "持仓股数"]
     )
-    if len(x) < 120:
-        raise ValueError("至少需要120个交易日数据，建议300日以上。")
-    return x
 
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_history(symbol: str) -> pd.DataFrame:
+# -----------------------------
+# 数据层
+# -----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def get_hist_akshare(code: str, days: int = 900) -> pd.DataFrame:
     import akshare as ak
 
-    symbol = str(symbol).strip().zfill(6)
-    errors = []
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    df = ak.stock_zh_a_hist(
+        symbol=code,
+        period="daily",
+        start_date=start_date,
+        end_date=end_date,
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        raise ValueError("AKShare未返回行情")
+    rename = {
+        "日期": "Date", "开盘": "Open", "收盘": "Close",
+        "最高": "High", "最低": "Low", "成交量": "Volume",
+        "成交额": "Amount", "涨跌幅": "PctChange",
+    }
+    df = df.rename(columns=rename)
+    df["Date"] = pd.to_datetime(df["Date"])
+    for col in ["Open", "Close", "High", "Low", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.set_index("Date").sort_index().dropna(subset=["Close"])
 
+@st.cache_data(ttl=900, show_spinner=False)
+def get_hist_yfinance(code: str, period: str = "3y") -> pd.DataFrame:
+    import yfinance as yf
+
+    suffix = ".SS" if code.startswith(("5", "6", "9")) else ".SZ"
+    raw = yf.download(
+        code + suffix,
+        period=period,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+    if raw is None or raw.empty:
+        raise ValueError("备用行情源未返回数据")
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    return raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+def get_history(code: str) -> tuple[pd.DataFrame, str]:
+    code = str(code).strip().zfill(6)
     try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date="20180101",
-            end_date="20991231",
-            adjust="qfq",
-        )
-        return normalize(df)
-    except Exception as exc:
-        errors.append(f"股票接口：{exc}")
+        return get_hist_akshare(code), "AKShare"
+    except Exception:
+        return get_hist_yfinance(code), "yfinance备用源"
 
-    try:
-        df = ak.fund_etf_hist_em(
-            symbol=symbol,
-            period="daily",
-            start_date="20180101",
-            end_date="20991231",
-            adjust="qfq",
-        )
-        return normalize(df)
-    except Exception as exc:
-        errors.append(f"ETF接口：{exc}")
-
-    raise RuntimeError("在线行情获取失败：" + " | ".join(errors))
-
-
-def rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(n).mean()
-    loss = (-delta.clip(upper=0)).rolling(n).mean()
-    return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-
-
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    prev_close = df["close"].shift()
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(n).mean()
-
-
-def build_features(df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
+# -----------------------------
+# 指标与策略引擎
+# -----------------------------
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-    close = x["close"]
-    volume = x["volume"]
+    c, h, l, v = x["Close"], x["High"], x["Low"], x["Volume"]
 
-    x["ret1"] = close.pct_change()
     for n in [5, 10, 20, 60, 120]:
-        x[f"ret{n}"] = close.pct_change(n)
-        x[f"ma{n}"] = close.rolling(n).mean()
-        x[f"pma{n}"] = close / x[f"ma{n}"] - 1
+        x[f"MA{n}"] = c.rolling(n).mean()
 
-    x["ema12"] = close.ewm(span=12, adjust=False).mean()
-    x["ema26"] = close.ewm(span=26, adjust=False).mean()
-    x["macd"] = x["ema12"] - x["ema26"]
-    x["macd_signal"] = x["macd"].ewm(span=9, adjust=False).mean()
-    x["macdh"] = x["macd"] - x["macd_signal"]
-    x["rsi"] = rsi(close)
-    x["atr"] = atr(x)
-    x["atrp"] = x["atr"] / close
-    x["vol20"] = x["ret1"].rolling(20).std() * np.sqrt(252)
-    x["vratio"] = volume.rolling(5).mean() / volume.rolling(20).mean()
+    macd = ta.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
+    x["MACD"] = macd.macd()
+    x["MACD_SIGNAL"] = macd.macd_signal()
+    x["MACD_HIST"] = macd.macd_diff()
 
-    mid = close.rolling(20).mean()
-    std = close.rolling(20).std()
-    lower = mid - 2 * std
-    upper = mid + 2 * std
-    x["bbpos"] = (close - lower) / (upper - lower)
-    x["dd60"] = close / close.rolling(60).max() - 1
+    x["RSI"] = ta.momentum.RSIIndicator(c, window=14).rsi()
 
-    x["future"] = close.shift(-horizon) / close - 1
-    x["target"] = (x["future"] > 0).astype(float)
+    stoch = ta.momentum.StochasticOscillator(h, l, c, window=9, smooth_window=3)
+    x["K"] = stoch.stoch()
+    x["D"] = stoch.stoch_signal()
+
+    x["ATR"] = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range()
+    x["ADX"] = ta.trend.ADXIndicator(h, l, c, window=14).adx()
+    x["OBV"] = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
+
+    bb = ta.volatility.BollingerBands(c, window=20, window_dev=2)
+    x["BB_UP"] = bb.bollinger_hband()
+    x["BB_MID"] = bb.bollinger_mavg()
+    x["BB_LOW"] = bb.bollinger_lband()
+
+    x["VOL_MA20"] = v.rolling(20).mean()
+    x["RET"] = c.pct_change()
+    x["VOLATILITY20"] = x["RET"].rolling(20).std() * np.sqrt(252)
+    x["HIGH20"] = h.rolling(20).max()
+    x["LOW20"] = l.rolling(20).min()
+    x["HIGH60"] = h.rolling(60).max()
+    x["LOW60"] = l.rolling(60).min()
     return x
 
-
-def clip(value: float) -> float:
-    return float(np.clip(value, 0, 100))
-
-
-def rule_scores(row: pd.Series) -> dict:
-    trend = 50
-    trend += 10 if row["close"] > row["ma20"] else -10
-    trend += 12 if row["ma20"] > row["ma60"] else -12
-    trend += 8 if row["ma60"] > row["ma120"] else -8
-    trend += 10 if row["macdh"] > 0 else -10
-    trend += 5 if row["vratio"] > 1.15 else 0
-
-    momentum = 50
-    for col, weight in [("ret20", 16), ("ret60", 18), ("ret120", 12)]:
-        momentum += weight if row[col] > 0 else -weight
-    momentum += 6 if row["vratio"] > 1 else -3
-
-    mean_reversion = 50
-    if row["rsi"] < 30:
-        mean_reversion += 25
-    elif row["rsi"] < 40:
-        mean_reversion += 12
-    elif row["rsi"] > 75:
-        mean_reversion -= 25
-    elif row["rsi"] > 65:
-        mean_reversion -= 12
-
-    if row["bbpos"] < 0.05:
-        mean_reversion += 15
-    elif row["bbpos"] > 0.95:
-        mean_reversion -= 15
-
-    risk_quality = 80
-    risk_quality -= max(0, (row["vol20"] - 0.22) * 100)
-    risk_quality += row["dd60"] * 80
-    risk_quality -= max(0, (row["atrp"] - 0.025) * 500)
-
-    return {
-        "趋势": clip(trend),
-        "动量": clip(momentum),
-        "均值回归": clip(mean_reversion),
-        "风险质量": clip(risk_quality),
-    }
-
-
-def ml_probability(features: pd.DataFrame) -> tuple[float, float | None]:
-    data = features.dropna(subset=["target"]).copy()
-    if len(data) < 220:
-        return 50.0, None
-
-    split = int(len(data) * 0.8)
-    train = data.iloc[:split]
-    valid = data.iloc[split:]
-
-    model = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            (
-                "model",
-                RandomForestClassifier(
-                    n_estimators=80,
-                    max_depth=5,
-                    min_samples_leaf=8,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-    model.fit(train[ML_FEATURES], train["target"].astype(int))
-
-    valid_prob = model.predict_proba(valid[ML_FEATURES])[:, 1]
-    latest_prob = float(
-        model.predict_proba(features[ML_FEATURES].iloc[[-1]])[:, 1][0]
-    )
-
+def finite(v, default=0.0):
     try:
-        auc = float(roc_auc_score(valid["target"].astype(int), valid_prob))
+        f = float(v)
+        return f if np.isfinite(f) else default
     except Exception:
-        auc = None
+        return default
 
-    return latest_prob * 100, auc
+def support_resistance(x: pd.DataFrame) -> tuple[float, float]:
+    tail = x.tail(120)
+    price = finite(tail["Close"].iloc[-1])
+    lows = tail["Low"].rolling(5, center=True).min()
+    highs = tail["High"].rolling(5, center=True).max()
 
+    support_candidates = tail.loc[tail["Low"] <= lows * 1.002, "Low"]
+    resistance_candidates = tail.loc[tail["High"] >= highs * 0.998, "High"]
 
-def analyze(df: pd.DataFrame, horizon: int = 5) -> dict:
-    feature_df = build_features(df, horizon)
-    row = feature_df.iloc[-1]
+    supports = support_candidates[support_candidates < price]
+    resistances = resistance_candidates[resistance_candidates > price]
 
-    scores = rule_scores(row)
-    ml_score, auc = ml_probability(feature_df)
-    scores["机器学习"] = ml_score
+    support = finite(supports.tail(10).median(), finite(tail["LOW20"].iloc[-1], price * .93))
+    resistance = finite(resistances.tail(10).median(), finite(tail["HIGH20"].iloc[-1], price * 1.08))
+    return support, resistance
 
-    weights = {
-        "趋势": 0.27,
-        "动量": 0.22,
-        "均值回归": 0.14,
-        "风险质量": 0.17,
-        "机器学习": 0.20,
-    }
-    composite = sum(scores[k] * weights[k] for k in scores)
+def score_stock(x: pd.DataFrame, market_score: int = 60, style: str = "稳健") -> dict:
+    if len(x) < 130:
+        raise ValueError("历史数据不足130个交易日")
 
-    agreement = max(0, 1 - np.std(list(scores.values())) / 35)
-    data_quality = min(1, len(df) / 500)
-    confidence = 100 * (0.65 * agreement + 0.35 * data_quality)
+    r = x.iloc[-1]
+    p = x.iloc[-2]
+    price = finite(r["Close"])
+    atr = max(finite(r["ATR"], price * .025), price * .008)
+    support, resistance = support_resistance(x)
 
-    volatility = row["vol20"] if pd.notna(row["vol20"]) else 0.35
-    risk_multiplier = np.clip(0.30 / max(volatility, 0.12), 0.45, 1.10)
-    position = np.clip(
-        max(0, (composite - 42) / 58)
-        * risk_multiplier
-        * confidence
-        / 100,
-        0,
-        0.80,
-    )
+    trend = momentum = volume_score = risk = 0
+    buy_reasons, sell_reasons, warnings = [], [], []
 
-    close = float(row["close"])
-    atr_value = float(row["atr"]) if pd.notna(row["atr"]) else close * 0.04
+    # 趋势 35
+    if r["MA5"] > r["MA10"] > r["MA20"]:
+        trend += 12
+        buy_reasons.append("短期均线多头排列")
+    elif r["MA5"] < r["MA10"]:
+        sell_reasons.append("短期均线转弱")
 
-    if composite >= 80:
-        signal = "强势买入候选"
-    elif composite >= 68:
-        signal = "分批买入"
-    elif composite >= 52:
-        signal = "持有/观察"
-    elif composite >= 38:
-        signal = "减仓"
+    if r["MA20"] > r["MA60"]:
+        trend += 10
+        buy_reasons.append("20日线位于60日线上方")
     else:
-        signal = "规避/卖出"
+        sell_reasons.append("中期趋势尚未转强")
+
+    if r["Close"] > r["MA20"]:
+        trend += 6
+    else:
+        sell_reasons.append("收盘价跌破20日均线")
+
+    if r["MA60"] > r["MA120"]:
+        trend += 4
+
+    if r["ADX"] >= 22:
+        trend += 3
+        buy_reasons.append("ADX显示趋势具备一定强度")
+
+    # 动量 30
+    if r["MACD"] > r["MACD_SIGNAL"]:
+        momentum += 8
+        if p["MACD"] <= p["MACD_SIGNAL"]:
+            momentum += 5
+            buy_reasons.append("MACD刚形成金叉")
+        else:
+            buy_reasons.append("MACD维持多头")
+    else:
+        sell_reasons.append("MACD位于信号线下方")
+
+    if 50 <= r["RSI"] <= 70:
+        momentum += 8
+        buy_reasons.append("RSI处于健康强势区")
+    elif 35 <= r["RSI"] < 50:
+        momentum += 3
+    elif r["RSI"] > 80:
+        risk += 8
+        warnings.append("RSI过热，追高风险较高")
+    elif r["RSI"] < 30:
+        warnings.append("RSI超卖，但需等待止跌确认")
+
+    if r["K"] > r["D"]:
+        momentum += 5
+        if p["K"] <= p["D"]:
+            momentum += 4
+            buy_reasons.append("KDJ形成金叉")
+    else:
+        sell_reasons.append("KDJ动能走弱")
+
+    # 成交与突破 20
+    vol_ratio = finite(r["Volume"] / r["VOL_MA20"], 1)
+    if 1.2 <= vol_ratio <= 2.8:
+        volume_score += 8
+        buy_reasons.append("成交量较20日均量放大")
+    elif vol_ratio > 3.5:
+        risk += 4
+        warnings.append("成交量异常放大，注意冲高回落")
+
+    if r["OBV"] > x["OBV"].rolling(20).mean().iloc[-1]:
+        volume_score += 5
+
+    if price >= finite(p["HIGH20"], price) * .995:
+        volume_score += 7
+        buy_reasons.append("接近或突破20日阶段高点")
+
+    # 市场环境 15
+    env = max(0, min(15, market_score * .15))
+
+    raw = trend + momentum + volume_score + env
+    risk_penalty = risk
+
+    vol_ann = finite(r["VOLATILITY20"])
+    if vol_ann > .55:
+        risk_penalty += 8
+        warnings.append("近20日年化波动率偏高")
+    elif vol_ann > .4:
+        risk_penalty += 4
+
+    score = int(max(0, min(100, round(raw - risk_penalty))))
+
+    style_map = {
+        "保守": (88, 76, .25),
+        "稳健": (82, 68, .35),
+        "积极": (76, 62, .45),
+    }
+    buy_cut, watch_cut, max_position = style_map[style]
+
+    if score >= buy_cut and len(sell_reasons) <= 1:
+        signal, css = "🟢 A级买入关注", "signal-buy"
+        position = max_position
+    elif score >= watch_cut:
+        signal, css = "🟡 试仓 / 持有", "signal-hold"
+        position = max_position * .55
+    elif score >= 52:
+        signal, css = "🟠 观望等待", "signal-hold"
+        position = max_position * .2
+    else:
+        signal, css = "🔴 减仓 / 回避", "signal-sell"
+        position = 0.0
+
+    # 动态交易区间与风控
+    buy_low = max(support, price - .55 * atr)
+    buy_high = price + .15 * atr
+    stop = max(support - .35 * atr, price - 2.1 * atr)
+    if stop >= price:
+        stop = price - 1.8 * atr
+
+    unit_risk = max(price - stop, price * .01)
+    target1 = price + 2.0 * unit_risk
+    target2 = price + 3.2 * unit_risk
+    rr1 = (target1 - price) / unit_risk
+
+    # 行为建议
+    if signal.startswith("🟢"):
+        action = "分两至三次建仓；首次不超过计划仓位的一半。"
+    elif signal.startswith("🟡"):
+        action = "已有持仓可观察；新仓只允许小仓试错。"
+    elif signal.startswith("🟠"):
+        action = "等待放量突破或回踩企稳，不追涨。"
+    else:
+        action = "优先控制风险；跌破止损位应执行纪律。"
 
     return {
-        "score": round(float(composite), 1),
-        "signal": signal,
-        "confidence": round(float(confidence), 1),
-        "probability": round(float(ml_score), 1),
-        "position": round(float(position * 100), 1),
-        "close": round(close, 3),
-        "stop": round(close - 2.2 * atr_value, 3),
-        "target_price": round(close + 3.2 * atr_value, 3),
-        "rsi": round(float(row["rsi"]), 1),
-        "volatility": round(float(volatility * 100), 1),
-        "scores": scores,
-        "auc": auc,
-        "feature_df": feature_df,
+        "price": price, "score": score, "signal": signal, "css": css,
+        "trend": trend, "momentum": momentum, "volume_score": volume_score,
+        "risk_penalty": risk_penalty, "market_env": env,
+        "buy_low": buy_low, "buy_high": buy_high, "stop": stop,
+        "target1": target1, "target2": target2, "rr1": rr1,
+        "support": support, "resistance": resistance,
+        "position": position, "atr": atr, "rsi": finite(r["RSI"]),
+        "adx": finite(r["ADX"]), "vol_ratio": vol_ratio,
+        "buy_reasons": buy_reasons, "sell_reasons": sell_reasons,
+        "warnings": warnings, "action": action,
     }
 
+def position_plan(result: dict, capital: float, risk_pct: float) -> dict:
+    price, stop = result["price"], result["stop"]
+    risk_per_share = max(price - stop, price * .01)
+    risk_budget = capital * risk_pct / 100
+    by_risk = math.floor(risk_budget / risk_per_share / 100) * 100
+    by_capital = math.floor(capital * result["position"] / price / 100) * 100
+    shares = max(0, min(by_risk, by_capital))
+    return {
+        "shares": shares,
+        "amount": shares * price,
+        "max_loss": shares * risk_per_share,
+        "position_pct": shares * price / capital if capital else 0,
+    }
 
-def diagnosis_text(name: str, symbol: str, result: dict) -> str:
-    positives = []
-    risks = []
+def backtest(x: pd.DataFrame, initial=100000.0, fee_rate=.0008) -> dict:
+    d = x.dropna().copy()
+    cash, shares = initial, 0
+    equity_curve, trades = [], []
+    entry_price = None
 
-    if result["scores"]["趋势"] >= 65:
-        positives.append("中期趋势结构偏强")
-    else:
-        risks.append("趋势尚未形成明显优势")
-
-    if result["scores"]["动量"] >= 65:
-        positives.append("20至120日动量较好")
-    else:
-        risks.append("价格动量偏弱或分化")
-
-    if result["rsi"] >= 70:
-        risks.append("RSI偏高，短线存在过热风险")
-    elif result["rsi"] <= 35:
-        positives.append("RSI处于相对低位，存在修复空间")
-
-    if result["volatility"] >= 40:
-        risks.append("近20日波动率较高")
-    else:
-        positives.append("近期波动处于可控范围")
-
-    positive_text = "；".join(positives) if positives else "暂未出现明显优势信号"
-    risk_text = "；".join(risks) if risks else "暂未发现突出的技术风险"
-
-    return f"""
-### {name}（{symbol}）诊断结论
-
-**综合评分：{result["score"]}/100　｜　信号：{result["signal"]}**
-
-**上涨概率：{result["probability"]}%　｜　置信度：{result["confidence"]}%**
-
-**积极因素：** {positive_text}。
-
-**主要风险：** {risk_text}。
-
-**仓位参考：** 模型建议上限约为 **{result["position"]}%**。  
-**价格纪律：** ATR参考止损 **{result["stop"]}**，参考目标 **{result["target_price"]}**。
-
-该结论来自历史行情与技术模型，不代表未来必然表现。
-"""
-
-
-def watchlist_editor():
-    st.subheader("管理自选股")
-
-    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
-    with c1:
-        new_name = st.text_input("股票名称", placeholder="例如：宁德时代")
-    with c2:
-        new_symbol = st.text_input("股票/ETF代码", placeholder="例如：300750")
-    with c3:
-        st.write("")
-        st.write("")
-        if st.button("添加自选", use_container_width=True):
-            name = new_name.strip()
-            symbol = new_symbol.strip()
-            if not name or not symbol:
-                st.warning("请填写名称和代码。")
-            elif not symbol.isdigit() or len(symbol) > 6:
-                st.warning("代码应为不超过6位的数字。")
-            else:
-                st.session_state.watchlist[name] = symbol.zfill(6)
-                st.success(f"已添加：{name} {symbol.zfill(6)}")
-                st.rerun()
-
-    if st.session_state.watchlist:
-        remove_name = st.selectbox(
-            "选择要删除的自选股", list(st.session_state.watchlist.keys())
+    for i in range(1, len(d)):
+        r, p = d.iloc[i], d.iloc[i-1]
+        price = finite(r["Close"])
+        buy = (
+            r["MA5"] > r["MA20"] and p["MA5"] <= p["MA20"]
+            and r["MACD"] > r["MACD_SIGNAL"]
+            and 40 < r["RSI"] < 75
         )
-        if st.button("删除所选", type="secondary"):
-            if remove_name in DEFAULT_WATCHLIST:
-                st.warning("默认标的也可以删除；再次点击确认。")
-                confirm_key = f"confirm_{remove_name}"
-                if st.session_state.get(confirm_key):
-                    del st.session_state.watchlist[remove_name]
-                    st.session_state.pop(confirm_key, None)
-                    st.rerun()
-                st.session_state[confirm_key] = True
-            else:
-                del st.session_state.watchlist[remove_name]
-                st.rerun()
+        sell = (
+            (r["MA5"] < r["MA20"] and p["MA5"] >= p["MA20"])
+            or r["RSI"] > 82
+        )
 
-    watchlist_df = pd.DataFrame(
-        [{"股票": name, "代码": symbol} for name, symbol in st.session_state.watchlist.items()]
-    )
-    st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
+        if shares == 0 and buy:
+            qty = math.floor(cash * .95 / price / 100) * 100
+            if qty > 0:
+                cost = qty * price * (1 + fee_rate)
+                cash -= cost
+                shares = qty
+                entry_price = price
+                trades.append({"日期": d.index[i], "动作": "买入", "价格": price, "股数": qty})
+        elif shares > 0 and sell:
+            cash += shares * price * (1 - fee_rate)
+            trades.append({"日期": d.index[i], "动作": "卖出", "价格": price, "股数": shares})
+            shares = 0
+            entry_price = None
 
-    st.download_button(
-        "导出自选股 CSV",
-        watchlist_df.to_csv(index=False).encode("utf-8-sig"),
-        "huntertrend_watchlist.csv",
-        "text/csv",
-        use_container_width=True,
-    )
+        equity_curve.append((d.index[i], cash + shares * price))
 
-    uploaded = st.file_uploader("导入自选股 CSV", type=["csv"])
-    if uploaded is not None:
+    if shares > 0:
+        cash += shares * finite(d["Close"].iloc[-1]) * (1 - fee_rate)
+        shares = 0
+
+    curve = pd.Series(dict(equity_curve), dtype=float)
+    total_return = cash / initial - 1
+    running_max = curve.cummax()
+    drawdown = curve / running_max - 1
+    max_dd = finite(drawdown.min())
+    years = max((d.index[-1] - d.index[0]).days / 365.25, 0.1)
+    annual = (cash / initial) ** (1 / years) - 1
+    ret = curve.pct_change().dropna()
+    sharpe = finite(ret.mean() / ret.std() * np.sqrt(252)) if ret.std() else 0
+
+    closed = []
+    current = None
+    for t in trades:
+        if t["动作"] == "买入":
+            current = t
+        elif t["动作"] == "卖出" and current:
+            pnl = (t["价格"] - current["价格"]) / current["价格"]
+            closed.append(pnl)
+            current = None
+    win_rate = sum(p > 0 for p in closed) / len(closed) if closed else 0
+
+    return {
+        "curve": curve, "trades": pd.DataFrame(trades),
+        "total_return": total_return, "annual": annual,
+        "max_dd": max_dd, "sharpe": sharpe,
+        "win_rate": win_rate, "closed_trades": len(closed),
+    }
+
+def csv_download(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+# -----------------------------
+# 侧边栏
+# -----------------------------
+with st.sidebar:
+    st.title("🦅 HunterTrend")
+    st.caption("Professional Final")
+    capital = st.number_input("账户资金（元）", 1000.0, 100000000.0, 100000.0, 1000.0)
+    risk_pct = st.slider("单笔最大亏损预算", .5, 5.0, 2.0, .5)
+    style = st.selectbox("交易风格", ["保守", "稳健", "积极"], index=1)
+    market_score = st.slider("市场环境评分", 0, 100, 60)
+    st.caption("市场环境可结合指数趋势、成交额与涨跌家数人工调整。")
+
+st.title("🦅 HunterTrend Professional Final")
+st.caption("买卖点｜全自选扫描｜交易计划｜回测｜持仓管理｜晨报")
+
+tabs = st.tabs(["单股决策", "自选股雷达", "策略回测", "持仓管理", "AI晨报", "使用说明"])
+
+# -----------------------------
+# 单股决策
+# -----------------------------
+with tabs[0]:
+    c1, c2 = st.columns([2, 1])
+    code = c1.text_input("A股代码", "600519", key="single_code")
+    analyze = c2.button("生成专业交易计划", type="primary", use_container_width=True)
+
+    if analyze:
         try:
-            imported = pd.read_csv(uploaded)
-            if not {"股票", "代码"}.issubset(imported.columns):
-                st.error("CSV必须包含“股票”和“代码”两列。")
-            elif st.button("确认导入"):
-                for _, row in imported.iterrows():
-                    name = str(row["股票"]).strip()
-                    symbol = str(row["代码"]).split(".")[0].strip().zfill(6)
-                    if name and symbol.isdigit():
-                        st.session_state.watchlist[name] = symbol
-                st.success("自选股已导入。")
-                st.rerun()
-        except Exception as exc:
-            st.error(f"导入失败：{exc}")
+            with st.spinner("正在获取行情并计算专业指标…"):
+                raw, source = get_history(code)
+                x = enrich(raw)
+                result = score_stock(x, market_score, style)
+                plan = position_plan(result, capital, risk_pct)
 
+            st.caption(f"数据源：{source}｜最后交易日：{x.index[-1].date()}")
 
-init_state()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("当前价", f"{result['price']:.2f}")
+            m2.metric("综合评分", f"{result['score']}/100")
+            m3.metric("建议仓位", f"{plan['position_pct']:.1%}")
+            m4.metric("建议股数", f"{plan['shares']}")
 
-st.title("📈 HunterTrend V2.1｜自选股智能分析")
-st.caption("支持自选股管理、批量评分、排行榜与单股诊断。仅用于研究和辅助决策。")
+            st.markdown(
+                f"<div class='{result['css']}'><b>{result['signal']}</b><br>{result['action']}</div>",
+                unsafe_allow_html=True,
+            )
 
-page = st.sidebar.radio(
-    "功能模块",
-    ["自选股总览", "单股深度诊断", "管理自选股", "模型说明"],
-)
-horizon = st.sidebar.selectbox("预测周期（交易日）", [3, 5, 10, 20], index=1)
+            plan_df = pd.DataFrame({
+                "交易项目": ["理想买入区间", "关键支撑", "阶段压力", "纪律止损",
+                           "第一目标", "第二目标", "第一目标盈亏比", "预计投入", "止损最大亏损"],
+                "专业结果": [
+                    f"{result['buy_low']:.2f} - {result['buy_high']:.2f}",
+                    f"{result['support']:.2f}", f"{result['resistance']:.2f}",
+                    f"{result['stop']:.2f}", f"{result['target1']:.2f}",
+                    f"{result['target2']:.2f}", f"1 : {result['rr1']:.2f}",
+                    f"{plan['amount']:,.0f} 元", f"{plan['max_loss']:,.0f} 元",
+                ]
+            })
+            st.dataframe(plan_df, hide_index=True, use_container_width=True)
 
-if page == "自选股总览":
-    st.subheader("自选股批量分析")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("趋势分", result["trend"])
+            s2.metric("动量分", result["momentum"])
+            s3.metric("量价分", result["volume_score"])
+            s4.metric("风险扣分", result["risk_penalty"])
 
-    if st.button("分析全部自选股", type="primary", use_container_width=True):
+            st.subheader("价格与趋势")
+            chart = x[["Close", "MA5", "MA20", "MA60"]].tail(180).rename(
+                columns={"Close": "收盘价"}
+            )
+            st.line_chart(chart)
+
+            left, right = st.columns(2)
+            with left:
+                st.markdown("#### 买入依据")
+                if result["buy_reasons"]:
+                    for item in result["buy_reasons"]:
+                        st.write("✅", item)
+                else:
+                    st.write("暂无足够的多信号共振。")
+            with right:
+                st.markdown("#### 卖出与风险")
+                items = result["sell_reasons"] + result["warnings"]
+                if items:
+                    for item in items:
+                        st.write("⚠️", item)
+                else:
+                    st.write("暂未发现明显趋势破坏。")
+
+            report = pd.DataFrame([{
+                "股票代码": code.zfill(6), "日期": str(x.index[-1].date()),
+                "当前价": result["price"], "评分": result["score"],
+                "信号": result["signal"], "买入下限": result["buy_low"],
+                "买入上限": result["buy_high"], "止损": result["stop"],
+                "目标一": result["target1"], "目标二": result["target2"],
+                "建议股数": plan["shares"], "预计投入": plan["amount"],
+            }])
+            st.download_button(
+                "下载本次交易计划 CSV",
+                data=csv_download(report),
+                file_name=f"HunterTrend_{code.zfill(6)}_trade_plan.csv",
+                mime="text/csv",
+            )
+        except Exception as e:
+            st.error(f"分析失败：{e}")
+
+# -----------------------------
+# 自选股雷达
+# -----------------------------
+with tabs[1]:
+    pool_text = st.text_area("自选股代码（逗号、空格或换行分隔）", DEFAULT_POOL, height=100)
+    if st.button("扫描自选股", type="primary"):
+        codes = [x.strip().zfill(6) for x in pool_text.replace("\n", ",").replace(" ", ",").split(",") if x.strip()]
         rows = []
         progress = st.progress(0)
-        names = list(st.session_state.watchlist.items())
-
-        for index, (name, symbol) in enumerate(names, start=1):
+        for idx, c in enumerate(codes):
             try:
-                df = fetch_history(symbol)
-                result = analyze(df, horizon)
-                rows.append(
-                    {
-                        "股票": name,
-                        "代码": symbol,
-                        "最新价": result["close"],
-                        "综合评分": result["score"],
-                        "上涨概率%": result["probability"],
-                        "置信度%": result["confidence"],
-                        "建议仓位%": result["position"],
-                        "信号": result["signal"],
-                        "RSI": result["rsi"],
-                        "波动率%": result["volatility"],
-                        "参考止损": result["stop"],
-                    }
-                )
-            except Exception as exc:
-                rows.append(
-                    {
-                        "股票": name,
-                        "代码": symbol,
-                        "最新价": np.nan,
-                        "综合评分": np.nan,
-                        "上涨概率%": np.nan,
-                        "置信度%": np.nan,
-                        "建议仓位%": np.nan,
-                        "信号": f"数据失败：{str(exc)[:40]}",
-                        "RSI": np.nan,
-                        "波动率%": np.nan,
-                        "参考止损": np.nan,
-                    }
-                )
-            progress.progress(index / max(len(names), 1))
-
-        st.session_state.batch_results = (
-            pd.DataFrame(rows)
-            .sort_values("综合评分", ascending=False, na_position="last")
-            .reset_index(drop=True)
-        )
-
-    if not st.session_state.batch_results.empty:
-        results = st.session_state.batch_results
-
-        valid = results.dropna(subset=["综合评分"])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("自选股数量", len(results))
-        c2.metric(
-            "最高评分",
-            "-" if valid.empty else f'{valid["综合评分"].max():.1f}',
-        )
-        c3.metric(
-            "平均建议仓位",
-            "-" if valid.empty else f'{valid["建议仓位%"].mean():.1f}%',
-        )
-
-        st.dataframe(results, use_container_width=True, hide_index=True)
-
+                raw, source = get_history(c)
+                x = enrich(raw)
+                r = score_stock(x, market_score, style)
+                rows.append({
+                    "股票代码": c, "现价": round(r["price"], 2), "评分": r["score"],
+                    "信号": r["signal"], "买入下限": round(r["buy_low"], 2),
+                    "买入上限": round(r["buy_high"], 2), "止损": round(r["stop"], 2),
+                    "目标一": round(r["target1"], 2), "趋势分": r["trend"],
+                    "动量分": r["momentum"], "量价分": r["volume_score"],
+                    "风险扣分": r["risk_penalty"], "数据源": source,
+                })
+            except Exception as e:
+                rows.append({"股票代码": c, "信号": f"数据失败：{str(e)[:25]}"})
+            progress.progress((idx + 1) / len(codes))
+        radar = pd.DataFrame(rows)
+        if "评分" in radar:
+            radar = radar.sort_values("评分", ascending=False, na_position="last")
+        st.dataframe(radar, hide_index=True, use_container_width=True)
         st.download_button(
-            "下载批量分析结果",
-            results.to_csv(index=False).encode("utf-8-sig"),
-            "huntertrend_watchlist_analysis.csv",
-            "text/csv",
-            use_container_width=True,
+            "下载自选股扫描结果",
+            data=csv_download(radar),
+            file_name="HunterTrend_watchlist_radar.csv",
+            mime="text/csv",
         )
-    else:
-        st.info("点击“分析全部自选股”，系统会逐只获取行情并生成排行榜。")
 
-elif page == "单股深度诊断":
-    if not st.session_state.watchlist:
-        st.warning("自选股为空，请先添加股票。")
-        st.stop()
-
-    selected_name = st.selectbox("选择自选股", list(st.session_state.watchlist.keys()))
-    selected_symbol = st.session_state.watchlist[selected_name]
-
-    if st.button("运行单股诊断", type="primary", use_container_width=True):
+# -----------------------------
+# 回测
+# -----------------------------
+with tabs[2]:
+    bt_code = st.text_input("回测股票代码", "300750", key="bt_code")
+    initial = st.number_input("回测初始资金", 10000.0, 10000000.0, 100000.0, 10000.0)
+    st.caption("策略：MA5上穿MA20 + MACD多头 + RSI过滤；MA5下穿MA20或RSI过热退出。")
+    if st.button("运行历史回测", type="primary"):
         try:
-            with st.spinner("正在获取行情并运行模型..."):
-                stock_df = fetch_history(selected_symbol)
-                result = analyze(stock_df, horizon)
+            raw, source = get_history(bt_code)
+            x = enrich(raw)
+            bt = backtest(x, initial=initial)
 
-            cols = st.columns(5)
-            metrics = [
-                ("综合评分", f'{result["score"]}/100'),
-                ("信号", result["signal"]),
-                ("上涨概率", f'{result["probability"]}%'),
-                ("置信度", f'{result["confidence"]}%'),
-                ("建议仓位", f'{result["position"]}%'),
-            ]
-            for col, (label, value) in zip(cols, metrics):
-                col.metric(label, value)
+            a, b, c, d, e = st.columns(5)
+            a.metric("累计收益", f"{bt['total_return']:.1%}")
+            b.metric("年化收益", f"{bt['annual']:.1%}")
+            c.metric("最大回撤", f"{bt['max_dd']:.1%}")
+            d.metric("夏普比率", f"{bt['sharpe']:.2f}")
+            e.metric("胜率", f"{bt['win_rate']:.1%}")
 
-            st.markdown(diagnosis_text(selected_name, selected_symbol, result))
-
-            vote_df = pd.DataFrame(
-                [
-                    {"模型": model, "评分": round(score, 1)}
-                    for model, score in result["scores"].items()
-                ]
-            )
-            st.subheader("模型投票")
-            st.dataframe(vote_df, use_container_width=True, hide_index=True)
-
-            fig = go.Figure(
-                go.Candlestick(
-                    x=stock_df["date"].tail(180),
-                    open=stock_df["open"].tail(180),
-                    high=stock_df["high"].tail(180),
-                    low=stock_df["low"].tail(180),
-                    close=stock_df["close"].tail(180),
-                    name="K线",
+            st.line_chart(bt["curve"].rename("策略净值"))
+            st.write(f"已闭合交易：{bt['closed_trades']} 次｜数据源：{source}")
+            if not bt["trades"].empty:
+                st.dataframe(bt["trades"], hide_index=True, use_container_width=True)
+                st.download_button(
+                    "下载交易明细",
+                    data=csv_download(bt["trades"]),
+                    file_name=f"HunterTrend_{bt_code}_backtest_trades.csv",
+                    mime="text/csv",
                 )
+            st.warning("历史回测不代表未来收益；本回测未完整模拟涨跌停、滑点、停牌、分红税与成交冲击。")
+        except Exception as e:
+            st.error(f"回测失败：{e}")
+
+# -----------------------------
+# 持仓管理
+# -----------------------------
+with tabs[3]:
+    st.subheader("持仓录入")
+    upload = st.file_uploader("上传持仓CSV（列名：股票代码、持仓成本、持仓股数）", type=["csv"])
+    if upload is not None:
+        try:
+            st.session_state.portfolio = pd.read_csv(upload, dtype={"股票代码": str})
+        except Exception as e:
+            st.error(f"持仓文件读取失败：{e}")
+
+    with st.form("add_holding"):
+        p1, p2, p3 = st.columns(3)
+        h_code = p1.text_input("股票代码", "600519")
+        h_cost = p2.number_input("持仓成本", 0.01, 100000.0, 100.0)
+        h_shares = p3.number_input("持仓股数", 100, 10000000, 100, 100)
+        submitted = st.form_submit_button("加入持仓")
+        if submitted:
+            new = pd.DataFrame([{
+                "股票代码": h_code.zfill(6), "持仓成本": h_cost, "持仓股数": h_shares
+            }])
+            st.session_state.portfolio = pd.concat(
+                [st.session_state.portfolio, new], ignore_index=True
             )
-            fig.update_layout(height=460, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
 
-            if result["auc"] is not None:
-                st.info(f'机器学习历史验证 AUC：{result["auc"]:.3f}')
-            else:
-                st.info("有效样本不足，机器学习模型采用中性评分。")
+    if not st.session_state.portfolio.empty:
+        st.dataframe(st.session_state.portfolio, hide_index=True, use_container_width=True)
+        if st.button("评估全部持仓", type="primary"):
+            rows = []
+            for _, h in st.session_state.portfolio.iterrows():
+                c = str(h["股票代码"]).zfill(6)
+                try:
+                    raw, source = get_history(c)
+                    x = enrich(raw)
+                    r = score_stock(x, market_score, style)
+                    cost = finite(h["持仓成本"])
+                    shares = int(h["持仓股数"])
+                    pnl = (r["price"] - cost) * shares
+                    pnl_pct = r["price"] / cost - 1 if cost else 0
+                    if r["price"] < r["stop"] or r["score"] < 50:
+                        holding_action = "减仓/执行止损"
+                    elif pnl_pct > .20 and r["score"] < 70:
+                        holding_action = "分批止盈"
+                    elif r["score"] >= 75:
+                        holding_action = "继续持有"
+                    else:
+                        holding_action = "观察"
+                    rows.append({
+                        "股票代码": c, "成本": cost, "现价": round(r["price"], 2),
+                        "持仓股数": shares, "浮动盈亏": round(pnl, 2),
+                        "收益率": f"{pnl_pct:.1%}", "AI评分": r["score"],
+                        "建议": holding_action, "防守位": round(r["stop"], 2),
+                    })
+                except Exception as e:
+                    rows.append({"股票代码": c, "建议": f"数据失败：{str(e)[:20]}"})
+            evaluation = pd.DataFrame(rows)
+            st.dataframe(evaluation, hide_index=True, use_container_width=True)
+            st.download_button(
+                "下载持仓诊断",
+                data=csv_download(evaluation),
+                file_name="HunterTrend_portfolio_review.csv",
+                mime="text/csv",
+            )
+    else:
+        st.info("尚未录入持仓。")
 
-        except Exception as exc:
-            st.exception(exc)
+# -----------------------------
+# AI晨报
+# -----------------------------
+with tabs[4]:
+    morning_pool = st.text_area("晨报股票池", DEFAULT_POOL, key="morning_pool")
+    if st.button("生成今日AI晨报", type="primary"):
+        codes = [x.strip().zfill(6) for x in morning_pool.replace("\n", ",").replace(" ", ",").split(",") if x.strip()]
+        rows = []
+        for c in codes:
+            try:
+                raw, source = get_history(c)
+                x = enrich(raw)
+                r = score_stock(x, market_score, style)
+                rows.append({
+                    "股票代码": c, "评分": r["score"], "信号": r["signal"],
+                    "现价": round(r["price"], 2),
+                    "关注区间": f"{r['buy_low']:.2f}-{r['buy_high']:.2f}",
+                    "止损": round(r["stop"], 2), "第一目标": round(r["target1"], 2),
+                    "核心逻辑": "；".join(r["buy_reasons"][:3]) or "等待信号",
+                    "主要风险": "；".join((r["sell_reasons"] + r["warnings"])[:2]) or "暂无明显风险",
+                })
+            except Exception as e:
+                rows.append({"股票代码": c, "信号": f"数据失败：{str(e)[:20]}"})
 
-elif page == "管理自选股":
-    watchlist_editor()
+        brief = pd.DataFrame(rows)
+        if "评分" in brief:
+            brief = brief.sort_values("评分", ascending=False, na_position="last")
+        st.subheader(f"HunterTrend AI晨报｜{datetime.now().strftime('%Y-%m-%d')}")
+        st.write(f"市场环境评分：**{market_score}/100**｜交易风格：**{style}**")
+        st.dataframe(brief, hide_index=True, use_container_width=True)
+        if not brief.empty and "评分" in brief and brief["评分"].notna().any():
+            top = brief.dropna(subset=["评分"]).iloc[0]
+            st.success(f"今日股票池首选：{top['股票代码']}｜评分 {int(top['评分'])}")
+        st.download_button(
+            "下载AI晨报",
+            data=csv_download(brief),
+            file_name=f"HunterTrend_morning_brief_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
 
-else:
-    st.subheader("模型说明")
-    st.markdown(
-        """
-### 当前模型构成
+# -----------------------------
+# 说明
+# -----------------------------
+with tabs[5]:
+    st.markdown("""
+### 专业版包含
+- 多指标买卖点：均线、MACD、KDJ、RSI、ADX、ATR、OBV、布林带与量价突破
+- 支撑压力、动态止损、两级止盈、盈亏比
+- 按账户资金与单笔最大亏损预算计算股数
+- 多股票自选雷达、CSV导出
+- 历史策略回测、收益/回撤/夏普/胜率
+- 持仓盈亏与减仓、止盈、继续持有建议
+- 每日AI晨报
 
-- **趋势模型**：MA20、MA60、MA120、MACD与成交量确认
-- **动量模型**：20日、60日、120日收益趋势
-- **均值回归模型**：RSI与布林带位置
-- **风险模型**：波动率、60日回撤与ATR
-- **机器学习模型**：随机森林，使用时间顺序切分进行历史验证
-
-### 自选股分析流程
-
-1. 从 AKShare 获取前复权历史行情。
-2. 对每只股票计算模型评分。
-3. 输出综合评分、上涨概率、置信度、建议仓位和ATR止损。
-4. 按综合评分生成自选股排行榜。
-
-应用不会自动下单，所有结果仅供研究参考。
-"""
-    )
+### 重要限制
+1. 本系统是研究和决策辅助工具，不是收益保证，也不替代持牌投资顾问。
+2. 免费行情源可能延迟、限流或临时失效；实盘前必须与券商行情核对。
+3. 当前版本不会自动下单。自动交易必须另接券商 QMT、PTrade 或合规交易接口。
+4. 回测没有完整覆盖涨跌停、停牌、滑点、成交冲击和所有交易费用。
+5. 买卖信号应结合公告、财务、行业、政策和个人风险承受能力。
+    """)
