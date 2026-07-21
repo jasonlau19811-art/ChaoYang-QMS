@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from datetime import date, timedelta
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -44,6 +45,54 @@ DEFAULT_NAMES = {
 
 def normalize_code(code: str) -> str:
     return "".join(ch for ch in str(code).strip() if ch.isdigit()).zfill(6)[-6:]
+
+def parse_stock_pool(file_bytes: bytes):
+    """解析 CSV/TXT 股票池，返回去重代码及文件中自带的名称。"""
+    text = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            text = file_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("文件编码无法识别，请保存为 UTF-8 或 GBK")
+
+    rows = [re.split(r"[,;\t，；|]+|\s+", line.strip()) for line in text.splitlines() if line.strip()]
+    if not rows:
+        return [], {}
+
+    header = [str(v).strip().lower() for v in rows[0]]
+    code_col = next(
+        (i for i, value in enumerate(header) if value in {"代码", "股票代码", "证券代码", "code", "symbol"}),
+        None,
+    )
+    name_col = next(
+        (i for i, value in enumerate(header) if value in {"名称", "股票名称", "股票简称", "证券简称", "name"}),
+        None,
+    )
+    data_rows = rows[1:] if code_col is not None else rows
+
+    codes, names, seen = [], {}, set()
+    for row in data_rows:
+        candidates = [row[code_col]] if code_col is not None and code_col < len(row) else row
+        raw_code = next(
+            (str(v).strip() for v in candidates if re.fullmatch(r"(?i)(?:sh|sz|bj)?\d{1,6}(?:\.0)?", str(v).strip())),
+            None,
+        )
+        if raw_code is None:
+            continue
+        raw_code = re.sub(r"\.0$", "", raw_code, flags=re.IGNORECASE)
+        code = normalize_code(raw_code)
+        if code == "000000" or code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+        if name_col is not None and name_col < len(row):
+            name = str(row[name_col]).strip()
+            if name and name.lower() != "nan":
+                names[code] = name
+    return codes, names
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_stock_names():
@@ -257,12 +306,34 @@ st.markdown('<div class="ht-title">🦅 HunterTrend V7 专业版</div>', unsafe_
 st.markdown('<div class="ht-sub">移动极速版 · 股票名称 · 买卖点 · 方案B回测 · 数据异常自动降级</div>', unsafe_allow_html=True)
 
 with st.expander("⚙️ 股票与数据设置", expanded=True):
+    pool_file = st.file_uploader(
+        "批量导入股票池（CSV/TXT）",
+        type=["csv", "txt"],
+        help="支持代码、股票代码、证券代码、code 或 symbol 列，也支持每行一个代码。",
+    )
+    pool_codes, pool_names = [], {}
+    if pool_file is not None:
+        try:
+            pool_codes, pool_names = parse_stock_pool(pool_file.getvalue())
+            if pool_codes:
+                st.success(f"已导入 {len(pool_codes)} 只股票")
+            else:
+                st.warning("没有识别到股票代码，请检查文件格式。")
+        except ValueError as exc:
+            st.error(str(exc))
+
     c1, c2 = st.columns([1.15, 1])
     with c1:
+        selected_pool_code = st.selectbox(
+            "股票池选择",
+            [""] + pool_codes,
+            format_func=lambda value: "手动输入" if not value else f"{value} {pool_names.get(value, '')}".strip(),
+            disabled=not pool_codes,
+        )
         code_input = st.text_input("输入A股代码", value=st.session_state.get("code", "300750"), max_chars=8)
-        code = normalize_code(code_input)
+        code = selected_pool_code or normalize_code(code_input)
         st.session_state["code"] = code
-        stock_name = get_stock_name(code)
+        stock_name = pool_names.get(code) or get_stock_name(code)
         st.caption(f"当前股票：{code} {stock_name}")
     with c2:
         period = st.selectbox("分析周期", ["近1年", "近2年", "近3年", "自定义"], index=1)
