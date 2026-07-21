@@ -2,7 +2,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from datetime import date, timedelta
-import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -98,6 +97,9 @@ def load_history(code: str, start: str, end: str):
         return df, f"演示数据（实时接口失败：{type(e).__name__}）"
 
 def indicators(df):
+    if df is None or df.empty:
+        raise ValueError("没有可用于计算指标的行情数据")
+
     x = df.copy()
     c = x["close"]
     x["MA5"] = c.rolling(5).mean()
@@ -189,16 +191,36 @@ def backtest(df, fee_bps=8, stop_loss=8, take_profit=20):
     years = max((x["date"].iat[-1] - x["date"].iat[0]).days / 365.25, 1/365.25)
     total = x["equity"].iat[-1] - 1
     annual = x["equity"].iat[-1] ** (1/years) - 1
-    vol = x["strategy_ret"].std() * np.sqrt(252)
-    sharpe = annual / vol if vol and not np.isnan(vol) else 0
+    daily_std = x["strategy_ret"].std()
+    sharpe = (
+        x["strategy_ret"].mean() / daily_std * np.sqrt(252)
+        if daily_std and not np.isnan(daily_std)
+        else 0
+    )
     dd = x["equity"] / x["equity"].cummax() - 1
     max_dd = dd.min()
-    completed = int((trades == 1).sum() // 2)
-    active_days = x.loc[x["position_bt"] == 1, "strategy_ret"]
-    win_rate = float((active_days > 0).mean()) if len(active_days) else 0
+
+    transitions = pos.diff().fillna(pos)
+    entry_indices = list(np.flatnonzero(transitions.to_numpy() == 1))
+    exit_indices = list(np.flatnonzero(transitions.to_numpy() == -1))
+    closed_returns = []
+    exit_cursor = 0
+    fee_rate = fee_bps / 10000
+    for entry_idx in entry_indices:
+        while exit_cursor < len(exit_indices) and exit_indices[exit_cursor] <= entry_idx:
+            exit_cursor += 1
+        if exit_cursor >= len(exit_indices):
+            break
+        exit_idx = exit_indices[exit_cursor]
+        gross_factor = x["close"].iat[exit_idx] / x["close"].iat[entry_idx]
+        closed_returns.append(gross_factor * (1 - fee_rate) ** 2 - 1)
+        exit_cursor += 1
+
+    completed = len(closed_returns)
+    win_rate = float(np.mean(np.asarray(closed_returns) > 0)) if closed_returns else 0
     return x, {
         "总收益": total, "年化收益": annual, "最大回撤": max_dd,
-        "夏普比率": sharpe, "交易次数": completed, "持仓日胜率": win_rate,
+        "夏普比率": sharpe, "交易次数": completed, "交易胜率": win_rate,
     }
 
 def fmt_pct(v):
@@ -323,7 +345,7 @@ with tab3:
     q4, q5, q6 = st.columns(3)
     q4.metric("夏普比率", f'{stats["夏普比率"]:.2f}')
     q5.metric("完成交易", f'{stats["交易次数"]} 次')
-    q6.metric("持仓日胜率", fmt_pct(stats["持仓日胜率"]))
+    q6.metric("交易胜率", fmt_pct(stats["交易胜率"]))
 
     eq = bt.set_index("date")[["equity","benchmark"]].rename(
         columns={"equity":"策略净值","benchmark":"买入持有"}
