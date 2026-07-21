@@ -41,6 +41,7 @@ DEFAULT_NAMES = {
     "601127": "赛力斯", "300124": "汇川技术", "000001": "平安银行",
     "600036": "招商银行", "601318": "中国平安", "000858": "五粮液",
     "600900": "长江电力", "601899": "紫金矿业", "002415": "海康威视",
+    "600089": "特变电工", "300476": "胜宏科技",
 }
 
 def normalize_code(code: str) -> str:
@@ -60,27 +61,39 @@ def parse_stock_pool(file_bytes: bytes):
 
     rows = [re.split(r"[,;\t，；|]+|\s+", line.strip()) for line in text.splitlines() if line.strip()]
     if not rows:
-        return [], {}
+        return [], {}, []
 
-    header = [str(v).strip().lower() for v in rows[0]]
-    code_col = next(
-        (i for i, value in enumerate(header) if value in {"代码", "股票代码", "证券代码", "code", "symbol"}),
-        None,
-    )
-    name_col = next(
-        (i for i, value in enumerate(header) if value in {"名称", "股票名称", "股票简称", "证券简称", "name"}),
-        None,
-    )
-    data_rows = rows[1:] if code_col is not None else rows
+    code_headers = {"代码", "股票代码", "证券代码", "code", "symbol"}
+    name_headers = {"名称", "股票名称", "股票简称", "证券名称", "证券简称", "name"}
+    header_idx, code_col, name_col = None, None, None
+    for idx, row in enumerate(rows):
+        header = [str(v).strip().lower() for v in row]
+        found_code = next((i for i, value in enumerate(header) if value in code_headers), None)
+        found_name = next((i for i, value in enumerate(header) if value in name_headers), None)
+        if found_code is not None or found_name is not None:
+            header_idx, code_col, name_col = idx, found_code, found_name
+            break
 
-    codes, names, seen = [], {}, set()
+    data_rows = rows[header_idx + 1:] if header_idx is not None else rows
+    headerless_code_list = header_idx is None and all(len(row) == 1 for row in rows)
+
+    codes, names, unresolved_names, seen = [], {}, [], set()
     for row in data_rows:
-        candidates = [row[code_col]] if code_col is not None and code_col < len(row) else row
+        if code_col is not None and code_col < len(row):
+            candidates = [row[code_col]]
+        elif headerless_code_list:
+            candidates = row
+        else:
+            candidates = []
         raw_code = next(
             (str(v).strip() for v in candidates if re.fullmatch(r"(?i)(?:sh|sz|bj)?\d{1,6}(?:\.0)?", str(v).strip())),
             None,
         )
         if raw_code is None:
+            if name_col is not None and name_col < len(row):
+                name = str(row[name_col]).strip()
+                if name and name not in {"合计", "标准券"}:
+                    unresolved_names.append(name)
             continue
         raw_code = re.sub(r"\.0$", "", raw_code, flags=re.IGNORECASE)
         code = normalize_code(raw_code)
@@ -92,7 +105,7 @@ def parse_stock_pool(file_bytes: bytes):
             name = str(row[name_col]).strip()
             if name and name.lower() != "nan":
                 names[code] = name
-    return codes, names
+    return codes, names, list(dict.fromkeys(unresolved_names))
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_stock_names():
@@ -311,16 +324,46 @@ with st.expander("⚙️ 股票与数据设置", expanded=True):
         type=["csv", "txt"],
         help="支持代码、股票代码、证券代码、code 或 symbol 列，也支持每行一个代码。",
     )
-    pool_codes, pool_names = [], {}
+    parsed_codes, parsed_names, unresolved_names = [], {}, []
     if pool_file is not None:
         try:
-            pool_codes, pool_names = parse_stock_pool(pool_file.getvalue())
-            if pool_codes:
-                st.success(f"已导入 {len(pool_codes)} 只股票")
+            parsed_codes, parsed_names, unresolved_names = parse_stock_pool(pool_file.getvalue())
+            if unresolved_names:
+                all_names = get_stock_names()
+                code_by_name = {str(name).strip(): code for code, name in all_names.items()}
+                still_unresolved = []
+                for name in unresolved_names:
+                    resolved_code = code_by_name.get(name)
+                    if resolved_code:
+                        if resolved_code not in parsed_codes:
+                            parsed_codes.append(resolved_code)
+                        parsed_names[resolved_code] = name
+                    else:
+                        still_unresolved.append(name)
+                unresolved_names = still_unresolved
+            if parsed_codes:
+                st.info(f"已识别 {len(parsed_codes)} 只 A 股，请点击确认导入。")
+                if unresolved_names:
+                    st.caption("未纳入：" + "、".join(unresolved_names))
             else:
-                st.warning("没有识别到股票代码，请检查文件格式。")
+                st.warning("没有识别到可分析的 A 股代码，请检查文件是否包含证券代码或证券名称。")
         except ValueError as exc:
             st.error(str(exc))
+
+    confirm_col, clear_col = st.columns(2)
+    if confirm_col.button("✅ 确认导入股票池", use_container_width=True, disabled=not parsed_codes):
+        st.session_state["stock_pool_codes"] = parsed_codes
+        st.session_state["stock_pool_names"] = parsed_names
+        st.rerun()
+    if clear_col.button("清空股票池", use_container_width=True, disabled=not st.session_state.get("stock_pool_codes")):
+        st.session_state.pop("stock_pool_codes", None)
+        st.session_state.pop("stock_pool_names", None)
+        st.rerun()
+
+    pool_codes = st.session_state.get("stock_pool_codes", [])
+    pool_names = st.session_state.get("stock_pool_names", {})
+    if pool_codes:
+        st.success(f"股票池已确认：共 {len(pool_codes)} 只，可在下方选择并分析。")
 
     c1, c2 = st.columns([1.15, 1])
     with c1:
