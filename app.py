@@ -60,6 +60,32 @@ def get_stock_names():
         pass
     return names
 
+@st.cache_data(ttl=24 * 3600, max_entries=500, show_spinner=False)
+def get_stock_name(code: str):
+    """按单只股票优先查询名称，全市场代码表作为备用。"""
+    code = normalize_code(code)
+    if code in DEFAULT_NAMES:
+        return DEFAULT_NAMES[code]
+
+    try:
+        import akshare as ak
+        info = ak.stock_individual_info_em(symbol=code, timeout=8)
+        if info is not None and not info.empty and {"item", "value"}.issubset(info.columns):
+            values = {
+                str(item).strip(): str(value).strip()
+                for item, value in zip(info["item"], info["value"])
+                if pd.notna(value)
+            }
+            for key in ("股票简称", "股票名称", "证券简称"):
+                name = values.get(key, "")
+                if name and name.lower() != "nan":
+                    return name
+    except Exception:
+        pass
+
+    name = get_stock_names().get(code, "")
+    return name if name else "名称获取失败"
+
 @st.cache_data(ttl=1800, max_entries=80, show_spinner=False)
 def load_history(code: str, start: str, end: str):
     code = normalize_code(code)
@@ -226,8 +252,6 @@ def backtest(df, fee_bps=8, stop_loss=8, take_profit=20):
 def fmt_pct(v):
     return f"{v*100:.2f}%"
 
-names = get_stock_names()
-
 # ----------------------------- Header -----------------------------
 st.markdown('<div class="ht-title">🦅 HunterTrend V7 专业版</div>', unsafe_allow_html=True)
 st.markdown('<div class="ht-sub">移动极速版 · 股票名称 · 买卖点 · 方案B回测 · 数据异常自动降级</div>', unsafe_allow_html=True)
@@ -238,7 +262,7 @@ with st.expander("⚙️ 股票与数据设置", expanded=True):
         code_input = st.text_input("输入A股代码", value=st.session_state.get("code", "300750"), max_chars=8)
         code = normalize_code(code_input)
         st.session_state["code"] = code
-        stock_name = names.get(code, "名称待获取")
+        stock_name = get_stock_name(code)
         st.caption(f"当前股票：{code} {stock_name}")
     with c2:
         period = st.selectbox("分析周期", ["近1年", "近2年", "近3年", "自定义"], index=1)
@@ -253,6 +277,8 @@ with st.expander("⚙️ 股票与数据设置", expanded=True):
     refresh = st.button("🔄 刷新行情（清除缓存）", use_container_width=True)
     if refresh:
         load_history.clear()
+        get_stock_name.clear()
+        get_stock_names.clear()
         st.rerun()
 
 with st.spinner("正在读取行情并计算信号…"):
